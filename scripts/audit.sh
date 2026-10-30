@@ -51,5 +51,25 @@ if writable_paths=$(find /var/www/devops-site -perm -o+w -print 2>/dev/null) && 
 fi
 check 'No world-writable web paths; TLS key root-owned and mode 600' secure "$web_permissions"
 
+echo '[5] Containerization'
+check 'Docker service active' active "$(systemctl is-active docker 2>/dev/null)"
+db_health=$(docker inspect -f '{{.State.Health.Status}}' app-db-1 2>/dev/null) || db_health=unavailable
+check 'PostgreSQL container healthy' healthy "$db_health"
+
+published_ports=unsafe
+if listeners=$(ss -H -ltn 2>/dev/null); then
+    published_ports=$(awk '
+        $4 ~ /:(5000|5432)$/ {
+            if ($4 != "127.0.0.1:5000" && $4 != "127.0.0.1:5432") bad=1
+            if ($4 == "127.0.0.1:5000") app=1
+        }
+        END {print (app && !bad) ? "secure" : "unsafe"}
+    ' <<< "$listeners")
+fi
+check 'App listens on 127.0.0.1:5000; no external ports 5000 or 5432' secure "$published_ports"
+app_home=$(getent passwd devops | cut -d: -f6)
+env_mode=$(stat -c '%a' "${app_home}/app/.env" 2>/dev/null) || env_mode=unavailable
+check 'Server app/.env mode equals 600' 600 "$env_mode"
+
 echo "Passed: $PASS, failed: $FAIL"
 [[ $FAIL -eq 0 ]] && exit 0 || exit 1
