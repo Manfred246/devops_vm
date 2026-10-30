@@ -27,5 +27,29 @@ check 'Firewall active' active "$(awk '/^Status:/ {print $2}' <<< "$ufw_status")
 check 'Default incoming policy is deny' deny "$(sed -n 's/^Default: \([^ ]*\) (incoming).*/\1/p' <<< "$ufw_status")"
 echo '[3] Accounts'
 awk -F: '$3>=1000 && $3<65534 {printf "    %s (uid=%s)\n",$1,$3}' /etc/passwd
+
+echo '[4] Web server'
+check 'Nginx service active' active "$(systemctl is-active nginx 2>/dev/null)"
+nginx_syntax=invalid
+if sudo /usr/sbin/nginx -t >/dev/null 2>&1; then nginx_syntax=valid; fi
+check 'Nginx configuration syntax valid' valid "$nginx_syntax"
+
+cert_min_days="${AUDIT_CERT_MIN_DAYS:-30}"
+cert_lifetime=insufficient
+if [[ "$cert_min_days" =~ ^[0-9]{1,5}$ ]] && (( 10#$cert_min_days <= 36500 )); then
+    if openssl x509 -in /etc/ssl/certs/devops.crt -noout -checkend "$((10#$cert_min_days * 86400))" >/dev/null 2>&1; then
+        cert_lifetime=sufficient
+    fi
+fi
+check "Certificate valid for at least $cert_min_days days" sufficient "$cert_lifetime"
+
+web_permissions=unsafe
+if writable_paths=$(find /var/www/devops-site -perm -o+w -print 2>/dev/null) && \
+   key_permissions=$(sudo stat -c '%a:%u' /etc/ssl/private/devops.key 2>/dev/null) && \
+   [[ -z "$writable_paths" && "$key_permissions" == 600:0 ]]; then
+    web_permissions=secure
+fi
+check 'No world-writable web paths; TLS key root-owned and mode 600' secure "$web_permissions"
+
 echo "Passed: $PASS, failed: $FAIL"
 [[ $FAIL -eq 0 ]] && exit 0 || exit 1

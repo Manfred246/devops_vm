@@ -296,3 +296,135 @@ UFW, FQDN и скрипт аудита настроены после снимк�
 `ssh -L 127.0.0.1:9090:127.0.0.1:8080 -N devops` с ответом HTTP 200.
 После проверки туннель и тестовый HTTP-процесс остановлены; файл страницы
 сохранен для повторения опыта. Разрешающее правило UFW для 8080 не добавлялось.
+
+## 8. Веб-сервер
+
+Практическая работа 6, 30 октября 2026 года. Перед началом выполнен откат
+на `01-clean-install`, затем конфигурация разделов 1–7 восстановлена по этому
+документу. Прежнее полное состояние отдельно сохранено в
+`03-practice5-complete`. Снимок `04-nginx-https` содержит настроенный HTTPS
+с временной страницей до доставки содержимого репозитория.
+
+### Пакеты и ресурс
+
+```bash
+sudo apt update
+sudo apt install -y nginx rsync
+sudo install -d -m 755 -o devops -g devops /var/www/devops-site
+```
+
+Использован пакет `nginx` из репозитория Ubuntu, версия 1.28.3.
+Ресурс: `/var/www/devops-site`, владелец `devops:devops`, каталоги 755,
+файлы 644. Пользователь `www-data` читает содержимое, но не изменяет его.
+Главный процесс Nginx работает от root, рабочие процессы — от www-data.
+
+### Сертификат и конфигурация
+
+Самоподписанный сертификат формируется один раз на сервере:
+
+```bash
+sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+  -keyout /etc/ssl/private/devops.key \
+  -out /etc/ssl/certs/devops.crt \
+  -subj '/CN=devops.local' \
+  -addext 'subjectAltName=DNS:devops.local'
+sudo chown root:root /etc/ssl/private/devops.key /etc/ssl/certs/devops.crt
+sudo chmod 600 /etc/ssl/private/devops.key
+sudo chmod 644 /etc/ssl/certs/devops.crt
+```
+
+Закрытый ключ `/etc/ssl/private/devops.key` остается на сервере, root:root 600.
+Открытый сертификат `/etc/ssl/certs/devops.crt` имеет root:root 644.
+CN и issuer равны `devops.local`, SAN содержит `DNS:devops.local`.
+Срок фактического сертификата: 30.10.2026 01:24:01 UTC —
+30.10.2027 01:24:01 UTC. При воспроизведении даты изменятся.
+Root читает ключ при запуске/перезагрузке конфигурации; рабочим процессам
+не требуется право самостоятельно открывать файл ключа.
+
+Файл `/etc/nginx/sites-available/devops-site`:
+
+```nginx
+server {
+    listen 80;
+    listen [::]:80;
+    server_name devops.local;
+    return 301 https://$host$request_uri;
+}
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name devops.local;
+    ssl_certificate /etc/ssl/certs/devops.crt;
+    ssl_certificate_key /etc/ssl/private/devops.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    root /var/www/devops-site;
+    index index.html;
+    location / {
+        try_files $uri $uri/ =404;
+    }
+    error_page 404 /404.html;
+    access_log /var/log/nginx/devops-site.access.log;
+    error_log /var/log/nginx/devops-site.error.log;
+}
+```
+
+Активировать конфигурацию ссылкой, отключить только ссылку default,
+оставляя `/etc/nginx/sites-available/default`:
+
+```bash
+sudo ln -s /etc/nginx/sites-available/devops-site /etc/nginx/sites-enabled/
+sudo unlink /etc/nginx/sites-enabled/default
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+Повторно создавать существующую ссылку или удалять отсутствующую не нужно.
+Каждое последующее изменение проверять `nginx -t` до reload. HSTS для
+учебного самоподписанного сертификата не добавляется. Правила UFW для
+80 и 443 уже существуют; профиль Nginx Full дополнительно не разрешается.
+
+### Доставка с Windows через WSL 1
+
+На хосте используется Ubuntu в WSL 1, без запуска гипервизора WSL 2.
+Установить `rsync`, `openssh-client`, `git`, `curl`. Ключ Windows
+`C:\Users\TPC\.ssh\devops_vm` скопировать в собственный `~/.ssh` WSL,
+задать каталогу 700, ключу и config 600. Проверенный открытый ключ сервера
+сохранить в known_hosts. Не использовать закрытый ключ непосредственно
+из `/mnt/c` и не включать его в репозиторий. Псевдоним `devops` соответствует
+HostName 127.0.0.1, Port 2222, User devops, IdentityFile ~/.ssh/devops_vm,
+IdentitiesOnly yes. Репозиторий доступен как `/mnt/e/Git/devops_vm`;
+`git config core.fileMode false` устраняет ложные изменения режимов на DrvFS.
+
+Открытый сертификат получить по доверенному SSH-каналу:
+
+```bash
+scp devops:/etc/ssl/certs/devops.crt ~/devops.crt
+rsync -avz --delete --dry-run --chmod=D755,F644 site/ devops:/var/www/devops-site/
+rsync -avz --delete --chmod=D755,F644 site/ devops:/var/www/devops-site/
+```
+
+В этой конфигурации VPN блокирует прямой Host-only, поэтому для проверок
+с Windows/WSL добавлены NAT-пробросы TCP 127.0.0.1:80 → гостевой 80 и
+127.0.0.1:443 → гостевой 443. Они доступны только локальному хосту.
+Имя devops.local в Windows hosts остается сопоставлено с 192.168.56.102.
+Проверка HTTPS через NAT сохраняет Host/SNI и проверяет сертификат:
+
+```bash
+curl --noproxy '*' --resolve devops.local:80:127.0.0.1 -I http://devops.local/
+curl --noproxy '*' --resolve devops.local:443:127.0.0.1 \
+  --cacert ~/devops.crt -I https://devops.local/
+DEPLOY_RESOLVE=devops.local:443:127.0.0.1 scripts/deploy.sh --dry-run
+DEPLOY_RESOLVE=devops.local:443:127.0.0.1 scripts/deploy.sh
+```
+
+Первый запуск новой команды rsync с `--delete` всегда предварять dry run.
+Штатный deploy требует чистого Git, включая индекс и неигнорируемые новые
+файлы, проверяет наличие index.html, нормализует права и возвращает 1 при
+неудаче синхронизации или HTTPS-проверки. Используется одно SSH-соединение
+на запуск; не выполнять шесть новых SSH-подключений за 30 секунд.
+
+### Аудит
+
+Скопировать `scripts/audit.sh` на сервер и выполнить с sudo для проверки
+sshd, UFW, Nginx и прав ключа. Нормальный результат — 10 успешных проверок,
+код 0. `AUDIT_CERT_MIN_DAYS=400` намеренно дает код 1; файл ресурса с
+правами 666 также дает код 1. После опыта вернуть 644 и повторить аудит.
