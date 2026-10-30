@@ -428,3 +428,131 @@ DEPLOY_RESOLVE=devops.local:443:127.0.0.1 scripts/deploy.sh
 sshd, UFW, Nginx и прав ключа. Нормальный результат — 10 успешных проверок,
 код 0. `AUDIT_CERT_MIN_DAYS=400` намеренно дает код 1; файл ресурса с
 правами 666 также дает код 1. После опыта вернуть 644 и повторить аудит.
+
+## 9. Контейнеризация
+
+Практическая работа 7, 30 октября 2026 года. Docker Engine 29.9.2 и
+Docker Compose v5.6.1 установлены из официального APT-репозитория Docker,
+без пакета docker.io. Инструкция: https://docs.docker.com/engine/install/ubuntu/ .
+Для установленной Ubuntu 26.04 LTS используется suite resolute, amd64:
+
+```bash
+sudo apt update
+sudo apt install -y ca-certificates curl
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+sudo chmod 644 /etc/apt/keyrings/docker.asc
+sudo tee /etc/apt/sources.list.d/docker.sources <<'EOF'
+Types: deb
+URIs: https://download.docker.com/linux/ubuntu
+Suites: resolute
+Components: stable
+Architectures: amd64
+Signed-By: /etc/apt/keyrings/docker.asc
+EOF
+sudo apt update
+sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo usermod -aG docker devops
+```
+
+Открыть новую SSH-сессию. Из учебных учетных записей в группе docker состоит
+только devops, уже имеющий sudo. Эта группа дает фактические полномочия root.
+Проверки: docker version, docker compose version, docker run --rm hello-world.
+
+### Проект и секреты
+
+Исходники хранятся в app/ репозитория, проект на сервере — /home/devops/app,
+владелец devops:devops. Доставка с хоста из WSL 1 сначала в пробном режиме:
+
+```bash
+rsync -avz --delete --exclude=.env --chmod=D755,F644 --dry-run app/ devops:app/
+rsync -avz --delete --exclude=.env --chmod=D755,F644 app/ devops:app/
+```
+
+Нормализация 755/644 нужна для исходников с DrvFS. Dockerfile использует
+python:3.12-slim, пользователя app, порт 5000 и exec-форму CMD Gunicorn.
+Внутри образа исходники принадлежат root:root и имеют 644: app их читает,
+но не перезаписывает. requirements.txt копируется отдельно до установки
+зависимостей, поэтому изменение app.py не сбрасывает кэш pip install.
+
+Файл /home/devops/app/.env создается только на сервере, devops:devops 600:
+
+```bash
+cd /home/devops/app
+umask 077
+cp .env.example .env
+chmod 600 .env
+sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$(openssl rand -hex 16)/" .env
+```
+
+Это первоначальная настройка: существующий секрет при обновлении не заменять.
+POSTGRES_DB и POSTGRES_USER равны app, DB_HOST=db, пароль случайный.
+.gitignore и app/.dockerignore исключают .env, rsync --exclude=.env сохраняет
+его при --delete. В Git хранится только .env.example с заглушкой change_me.
+Не публиковать полный docker compose config или inspect с окружением;
+для проверки использовать docker compose config --quiet.
+
+### Сеть том и запуск
+
+```bash
+cd /home/devops/app
+docker compose up -d --build --wait --wait-timeout 90
+docker compose ps
+docker compose exec -T app id </dev/null
+docker compose exec -T app getent hosts db </dev/null
+```
+
+Конфигурация — app/docker-compose.yml, имя проекта app задается каталогом.
+Сервисы app и db работают в пользовательской bridge-сети app_backend,
+встроенный DNS разрешает db в текущий IP контейнера БД. Контейнеры называются
+app-app-1 и app-db-1. PostgreSQL использует postgres:16-alpine,
+pg_isready: интервал 5 секунд, тайм-аут 3 секунды, 5 попыток.
+depends_on: service_healthy задерживает запуск app до готовности db.
+У обоих сервисов restart: unless-stopped.
+
+Публикуется только 127.0.0.1:5000:5000; порт БД 5432 не публикуется.
+EXPOSE не публикует порт. Правила UFW для 5000/5001/5432 не добавляются.
+Том app_db_data смонтирован в /var/lib/postgresql/data. Обычный down
+сохраняет том; down -v использован только для синтетических посещений
+этого нового проекта в упражнении. При штатном обновлении -v не применять.
+Действующий проект, том и снимки после работы сохраняются.
+
+### Обратный прокси
+
+В HTTPS-блок /etc/nginx/sites-available/devops-site добавлено:
+
+```nginx
+location /app/ {
+    proxy_pass http://127.0.0.1:5000/;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+```
+
+Статические root, location / и error_page из раздела 8 сохранены.
+Применение: sudo nginx -t && sudo systemctl reload nginx.
+Завершающий слеш proxy_pass заменяет префикс /app/ на /.
+При включенном VPN проверки с WSL используют NAT с сохранением Host/SNI:
+
+```bash
+curl --noproxy '*' --resolve devops.local:443:127.0.0.1 --cacert ~/devops.crt https://devops.local/app/
+curl --noproxy '*' --resolve devops.local:443:127.0.0.1 --cacert ~/devops.crt https://devops.local/app/health
+curl --noproxy '*' --resolve devops.local:443:127.0.0.1 --cacert ~/devops.crt -I https://devops.local/
+```
+
+При 502 проверить 127.0.0.1:5000, docker compose ps/logs app и журнал
+/var/log/nginx/devops-site.error.log. Connection refused у upstream
+означает отказ между Nginx и приложением, после установления клиентского TLS.
+
+### Аудит и снимок
+
+Копия аудита: /home/devops/devops-course-2026/scripts/audit.sh.
+Раздел [5] проверяет Docker, healthy у app-db-1, отсутствие внешних
+слушающих сокетов 5000/5432 и права .env 600. Для 5000 дополнительно
+требуется наличие 127.0.0.1:5000. Штатно — 14 проверок, код 0.
+Временная публикация 5000:5000 дает код 1; после проверки вернуть
+127.0.0.1:5000:5000 и пересоздать app. Снимок 05-docker-compose создается
+после проверки Compose и тома, до настройки обратного прокси;
+снимок 04-nginx-https сохраняется.
