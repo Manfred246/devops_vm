@@ -556,3 +556,48 @@ curl --noproxy '*' --resolve devops.local:443:127.0.0.1 --cacert ~/devops.crt -I
 127.0.0.1:5000:5000 и пересоздать app. Снимок 05-docker-compose создается
 после проверки Compose и тома, до настройки обратного прокси;
 снимок 04-nginx-https сохраняется.
+
+
+## 10. Ansible
+
+Практические работы 10–11, 27 ноября 2026 г.
+
+Образ: `ghcr.io/manfred246/devops-ci-app`. Публичный пакет допускает анонимное чтение.
+Проверенный полный SHA: `123bb3fa8f8fd7477343bed8afa043619f72cecd`.
+Контейнер `devops-ci-app`: `127.0.0.1:5000:5000`; Nginx публикует порт 80, `/health` возвращает `{"status":"ok"}`.
+
+Управляющий узел — WSL 1 Ubuntu-24.04-devops на Windows, проект `~/devops-course-2026/ansible`.
+Управляемый узел — VirtualBox devops-vm, Ubuntu 26.04.1, Host-only 192.168.56.102.
+При включенном VPN используется NAT 127.0.0.1:2222 → VM:22 и 127.0.0.1:80 → VM:80.
+Доступ к SSH из WSL осуществляется локальным connection plugin windows_bridge через Windows Paramiko;
+он сохраняет проверку известного ключа хоста, шифрование SSH и выполняет модули на VM.
+Ansible-core 2.20.11 выбран для поддержки Python 3.14 на VM. Коллекции закреплены в requirements.yml.
+Закрытые ключи, пароли и known_hosts находятся вне репозитория.
+
+Bootstrap использует реальную учетную запись mattew (вместо student из методички).
+Открытый ключ предварительно установлен по разрешенному варианту bootstrap без sshpass.
+Prod использует devops, тот же SSH-ключ и проверенный sudoers NOPASSWD.
+
+Роли: base — зависимости и официальный Docker; ssh — ключ, sudoers, ограничения SSH и UFW;
+nginx — обратный прокси, отключение default site, проверка и reload; app — pull по SHA,
+контейнер на loopback и health-check. `force_handlers = True` обеспечивает применение изменений
+конфигурации и при последующей ошибке задачи.
+
+Команды на управляющем узле:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+cd ~/devops-course-2026/ansible
+ansible-inventory --graph
+ansible-playbook -i inventory/bootstrap.ini site.yml --syntax-check
+ansible-playbook -i inventory/bootstrap.ini site.yml --ask-become-pass
+ansible all -m ping
+ansible-playbook site.yml
+ansible-playbook verify.yml
+```
+
+В текущей сетевой среде DNS гостевой системы использует локальный DNS forwarder Windows
+(127.0.0.1:1053, доступен VM через 10.0.2.2:1053), который запрашивает штатный Windows resolver.
+Процесс и журнал размещены только в игнорируемом tmp/practices9-12, VPN не отключается.
+При перезапуске VM link DNS требуется снова задать через `sudo resolvectl dns enp0s3 10.0.2.2:1053`.
+Это зависимость учебного стенда, а не настройка для промышленного сервера.
