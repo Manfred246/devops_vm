@@ -100,7 +100,12 @@ class Connection(ConnectionBase):
 
     def exec_command(self, cmd, in_data=None, sudoable=True):
         super().exec_command(cmd,in_data=in_data,sudoable=sudoable)
-        return self._call('exec',command=cmd,data=in_data or b'')
+        data = in_data or b''
+        if sudoable and self.become:
+            password = self.become.get_option('become_pass')
+            if password and self.become.check_success(cmd.encode()):
+                data = password.encode() + b'\n' + data
+        return self._call('exec',command=cmd,data=data)
 
     def put_file(self, in_path, out_path):
         super().put_file(in_path,out_path)
